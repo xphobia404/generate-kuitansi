@@ -2,74 +2,136 @@
 
 namespace App\Http\Controllers;
 
+use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\Request;
-use Spatie\Browsershot\Browsershot;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use App\Models\KuitansiSequence;
 
 class KuitansiController extends Controller
 {
-    public function preview()
+    public function create()
     {
-        $items = [
-            ['name' => 'Becom-Zet 10 Kaplet', 'qty' => 1, 'price' => 29500],
-            ['name' => 'Indexon 0.5 mg 10 Tablet', 'qty' => 1, 'price' => 12100],
-            ['name' => 'Sanadryl Expectorant Sirup 120 ml', 'qty' => 1, 'price' => 20100],
-        ];
+        return view('kuitansi.create');
+    }
 
-        $subtotal = collect($items)->sum(fn ($i) => $i['qty'] * $i['price']);
-        $fee = 18000;
-        $total = $subtotal + $fee;
+    public function generatePdf(Request $request)
+    {
+        $data = $this->prepareData($request);
 
-        return view('kuitansi', [
-            'customer_name' => 'Yohanes Limbong',
-            'npwp'          => '00.000.000.0-0.000',
-            'customer_addr' => 'Jl. Taruna 5 No.11, RT.19/RW.3, Serdang, ...',
-            'items'         => $items,
-            'subtotal'      => $subtotal,
-            'fee_label'     => 'Biaya layanan',
-            'fee'           => $fee,
-            'total'         => $total,
-            // dan variable lain (dokter, invoice, dsb)
+        $pdf = Pdf::loadView('kuitansi.pdf', $data)->setPaper('a4', 'portrait');
+
+        $filename = 'kuitansi-' . $data['nomor_kuitansi'] . '.pdf';
+        $path = 'kuitansi/' . $filename;
+
+        Storage::disk('public')->put($path, $pdf->output());
+
+        return response()->download(storage_path('app/public/' . $path));
+    }
+
+    private function prepareData(Request $request): array
+    {
+        $validated = $request->validate([
+            'company_name' => ['nullable', 'string', 'max:255'],
+            'recipient_name' => ['required', 'string', 'max:255'],
+            'recipient_npwp' => ['nullable', 'string', 'max:255'],
+            'recipient_address' => ['nullable', 'string'],
+            'doctor_name' => ['nullable', 'string', 'max:255'],
+            'doctor_speciality' => ['nullable', 'string', 'max:255'],
+            'consultation_id' => ['nullable', 'string', 'max:255'],
+            'pharmacy_name' => ['nullable', 'string', 'max:255'],
+            'pharmacy_sia' => ['nullable', 'string', 'max:255'],
+            'pharmacy_address' => ['nullable', 'string'],
+            'pharmacy_phone' => ['nullable', 'string', 'max:50'],
+            'help_contact' => ['nullable', 'string', 'max:255'],
+            'metode_pembayaran' => ['nullable', 'string', 'max:100'],
+            'id_kiriman' => ['nullable', 'string', 'max:255'],
+            'biaya_layanan' => ['nullable', 'numeric', 'min:0'],
+            'items' => ['nullable', 'array'],
+            'items.*.name' => ['required_with:items', 'string', 'max:255'],
+            'items.*.qty' => ['required_with:items', 'numeric', 'min:1'],
+            'items.*.price' => ['required_with:items', 'numeric', 'min:0'],
+        ]);
+
+        $items = collect($validated['items'] ?? [])
+            ->map(function ($item) {
+                $qty = (int) ($item['qty'] ?? 0);
+                $price = (float) ($item['price'] ?? 0);
+
+                return [
+                    'name' => $item['name'] ?? '',
+                    'qty' => $qty,
+                    'price' => $price,
+                    'total' => $qty * $price,
+                ];
+            })
+            ->values()
+            ->all();
+
+        $subtotal = collect($items)->sum('total');
+        $biayaLayanan = (float) ($validated['biaya_layanan'] ?? 0);
+        $grandTotal = $subtotal + $biayaLayanan;
+
+        $companyName = $validated['company_name'] ?? 'Halodoc';
+
+        return array_merge($validated, [
+            'company_name' => $companyName,
+            'header_note' => 'Terima kasih telah bertransaksi di ' . $companyName,
+            'items' => $items,
+            'subtotal' => $subtotal,
+            'biaya_layanan' => $biayaLayanan,
+            'grand_total' => $grandTotal,
+            'nomor_kuitansi' => $this->generateNomorKuitansi(),
+            'terbilang_total' => ucfirst(trim(terbilang($grandTotal))) . ' rupiah',
+            'help_contact' => $validated['help_contact'] ?? 'help@halodoc.com',
+            'metode_pembayaran' => $validated['metode_pembayaran'] ?? 'Wallet',
         ]);
     }
 
-    public function downloadPdf()
+    private function generateNomorKuitansi(): string
     {
-        // render blade ke HTML string
-        $html = view('kuitansi', $this->dummyData())->render();
+        $date = now()->format('dmY');
+        $yearRoman = $this->toRoman((int) now()->format('Y'));
+        $period = now()->format('Ymd');
 
-        $path = storage_path('app/public/kuitansi-halodoc.pdf');
+        return DB::transaction(function () use ($date, $yearRoman, $period) {
+            $sequence = KuitansiSequence::where('period', $period)
+                ->lockForUpdate()
+                ->first();
 
-        Browsershot::html($html)
-            ->format('A4')            // ukuran A4 [web:17][web:23]
-            ->showBackground()        // supaya warna tabel ikut tercetak [web:17]
-            ->margins(12, 12, 12, 12) // top,right,bottom,left (mm kira-kira) [web:17]
-            ->save($path);            // simpan file PDF [web:17]
+            if (! $sequence) {
+                $sequence = KuitansiSequence::create([
+                    'period' => $period,
+                    'last_number' => 0,
+                ]);
+                $sequence->refresh();
+            }
 
-        return response()->download($path)->deleteFileAfterSend();
+            $sequence->increment('last_number');
+
+            $serial = str_pad($sequence->last_number, 4, '0', STR_PAD_LEFT);
+
+            return "INV/{$date}/{$yearRoman}/{$serial}";
+        });
     }
 
-    private function dummyData(): array
+    private function toRoman(int $number): string
     {
-        $items = [
-            ['name' => 'Becom-Zet 10 Kaplet', 'qty' => 1, 'price' => 29500],
-            ['name' => 'Indexon 0.5 mg 10 Tablet', 'qty' => 1, 'price' => 12100],
-            ['name' => 'Sanadryl Expectorant Sirup 120 ml', 'qty' => 1, 'price' => 20100],
+        $map = [
+            1000 => 'M', 900 => 'CM', 500 => 'D', 400 => 'CD',
+            100 => 'C', 90 => 'XC', 50 => 'L', 40 => 'XL',
+            10 => 'X', 9 => 'IX', 5 => 'V', 4 => 'IV', 1 => 'I',
         ];
 
-        $subtotal = collect($items)->sum(fn ($i) => $i['qty'] * $i['price']);
-        $fee = 18000;
-        $total = $subtotal + $fee;
+        $result = '';
 
-        return [
-            'customer_name' => 'Yohanes Limbong',
-            'npwp'          => '00.000.000.0-0.000',
-            'customer_addr' => 'Jl. Taruna 5 No.11, RT.19/RW.3, Serdang, ...',
-            'items'         => $items,
-            'subtotal'      => $subtotal,
-            'fee_label'     => 'Biaya layanan',
-            'fee'           => $fee,
-            'total'         => $total,
-            // tambahkan semua field lain yang dipakai di Blade
-        ];
+        foreach ($map as $value => $roman) {
+            while ($number >= $value) {
+                $result .= $roman;
+                $number -= $value;
+            }
+        }
+
+        return $result;
     }
 }
